@@ -20,6 +20,7 @@ A complete guide to syncing content into Open WebUI Knowledge Bases.
   - [GitHub](#github)
   - [GitLab / Bitbucket](#gitlab--bitbucket)
   - [Confluence](#confluence)
+  - [BookStack](#bookstack)
   - [Cloud Storage (S3 / GCS / Azure)](#cloud-storage-s3--gcs--azure)
   - [SharePoint](#sharepoint)
   - [Nextcloud](#nextcloud)
@@ -249,6 +250,41 @@ oikb sync confluence:SPACE_KEY --kb-id your-kb-id
 ```
 
 Requires `CONFLUENCE_URL`, `CONFLUENCE_USERNAME`, and `CONFLUENCE_API_TOKEN`.
+
+### BookStack
+
+```bash
+# Sync all pages from all BookStack books as Markdown files.
+oikb sync bookstack: --kb-id your-kb-id
+
+# Sync one specific BookStack page.
+oikb sync 'bookstack:pages?include_ids=12' --kb-id your-kb-id
+
+# Sync one BookStack book as chapter files; pages outside chapters remain page files.
+oikb sync 'bookstack:books?include_ids=12&output=chapters' --kb-id your-kb-id
+
+# Sync one whole BookStack book as a PDF file.
+oikb sync 'bookstack:books?include_ids=12&output=books&format=pdf' --kb-id your-kb-id
+
+# Sync all pages from one shelf and preserve shelf/book/chapter paths.
+oikb sync 'bookstack:shelves?include_ids=5&structure=hierarchical' --kb-id your-kb-id
+```
+
+Requires `BOOKSTACK_URL`, `BOOKSTACK_TOKEN_ID`, and `BOOKSTACK_TOKEN_SECRET`.
+
+Defaults are `bookstack:books`, `output=pages`, `format=md`, and `structure=flat`.
+
+| Parameter | Values | Description |
+|---|---|---|
+| `output` | `pages`, `chapters`, `books` | Exports individual pages, chapters where pages are grouped in chapters, or whole books. |
+| `format` | `txt`, `md`, `html`, `pdf` | Exported file format. |
+| `structure` | `flat`, `hierarchical` | Keeps files flat or mirrors shelf/book/chapter paths where available. |
+| `include_ids` | comma-separated IDs | Limits the selected pages, books, or shelves. |
+| `exclude_ids` | comma-separated IDs | Excludes selected pages, books, or shelves. |
+
+Use `bookstack:pages`, `bookstack:books`, or `bookstack:shelves` to select what IDs refer to. `bookstack:` defaults to `bookstack:books`.
+When `bookstack:pages` is used, `output` is always treated as `pages`.
+With `output=chapters`, pages outside chapters remain individual page exports.
 
 ### Cloud Storage (S3 / GCS / Azure)
 

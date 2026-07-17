@@ -6,12 +6,20 @@ Uses the GitLab Repository Tree API — no local clone needed.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import urllib.parse
 
 import httpx
 
 from oikb.connectors import BaseConnector, ManifestEntry
+
+_WIKI_FORMAT_EXT = {
+    "markdown": ".md",
+    "rdoc": ".rdoc",
+    "asciidoc": ".adoc",
+    "org": ".org",
+}
 
 
 class GitLabConnector(BaseConnector):
@@ -34,11 +42,14 @@ class GitLabConnector(BaseConnector):
         path: str | None = None,
         token: str | None = None,
         base_url: str | None = None,
+        is_wiki: bool = False,
     ):
         self.owner = owner
         self.repo = repo
         self.branch = branch
         self.path = path.strip("/") if path else None
+        self.is_wiki = is_wiki
+        self._cache: dict[str, str] = {}
         self._token = token or os.environ.get("GITLAB_TOKEN")
         self._base_url = (
             base_url or os.environ.get("GITLAB_URL", "https://gitlab.com")
@@ -111,6 +122,9 @@ class GitLabConnector(BaseConnector):
         Uses the recursive tree API. Blob IDs are content-addressable hashes.
         """
         self._ensure_resolved()
+        if self.is_wiki:
+            return self._build_wiki_manifest()
+
         ref = self.branch or self._get_default_branch()
         entries: list[ManifestEntry] = []
 
@@ -168,6 +182,9 @@ class GitLabConnector(BaseConnector):
     def read_file(self, path: str, filename: str) -> bytes:
         """Download a file's raw content via the GitLab Repository Files API."""
         self._ensure_resolved()
+        if self.is_wiki:
+            key = f"{path}/{filename}" if path else filename
+            return (self._cache.get(key) or "").encode("utf-8")
 
         file_path = f"{path}/{filename}" if path else filename
         if self.path:
@@ -183,6 +200,49 @@ class GitLabConnector(BaseConnector):
         resp.raise_for_status()
         return resp.content
 
+    def _build_wiki_manifest(self) -> list[ManifestEntry]:
+        resp = self._http.get(
+            f"/projects/{self._project_id}/wikis",
+            params={"with_content": 1},
+        )
+        resp.raise_for_status()
+
+        entries: list[ManifestEntry] = []
+        for page in resp.json():
+            slug = page.get("slug")
+            if not slug:
+                continue
+
+            content = page.get("content")
+            if content is None:
+                content = self._fetch_wiki_page(slug)
+
+            title = page.get("title") or slug
+            text = f"# {title}\n\n{content or ''}"
+            ext = _WIKI_FORMAT_EXT.get(page.get("format", "markdown"), ".md")
+            dir_path, _, base = slug.rpartition("/")
+            filename = f"{base or slug}{ext}"
+            checksum = hashlib.sha256(text.encode()).hexdigest()[:16]
+
+            entries.append(
+                ManifestEntry(
+                    filename=filename,
+                    path=dir_path,
+                    checksum=checksum,
+                    size=len(text.encode()),
+                )
+            )
+            self._cache[f"{dir_path}/{filename}" if dir_path else filename] = text
+
+        entries.sort(key=lambda e: e.display_path)
+        return entries
+
+    def _fetch_wiki_page(self, slug: str) -> str:
+        encoded_slug = urllib.parse.quote(slug, safe="")
+        resp = self._http.get(f"/projects/{self._project_id}/wikis/{encoded_slug}")
+        resp.raise_for_status()
+        return resp.json().get("content") or ""
+
     def _get_default_branch(self) -> str:
         """Fetch the project's default branch name."""
         self._ensure_resolved()
@@ -194,23 +254,33 @@ class GitLabConnector(BaseConnector):
         self._http.close()
 
 
-def parse_gitlab_source(source: str) -> dict[str, str | None]:
+def parse_gitlab_source(source: str) -> dict[str, str | bool | None]:
     """Parse a gitlab:owner/repo[/path] source string.
 
     Supports:
       - Standard format: gitlab:owner/repo/path/to/docs
       - Explicit project:path format: gitlab:group/subgroup/project:path/to/docs
+      - Wiki format: gitlab:group/subgroup/project?wiki=true
     """
     source = source.removeprefix("gitlab:")
+    source, _, query = source.partition("?")
+    params = urllib.parse.parse_qs(query)
+    is_wiki = params.get("wiki", ["false"])[-1].lower() in ("", "1", "true", "yes")
+
+    if is_wiki:
+        parts = source.rsplit("/", 1)
+        if len(parts) == 2:
+            return {"owner": parts[0], "repo": parts[1], "path": None, "wiki": True}
+        return {"owner": source, "repo": None, "path": None, "wiki": True}
 
     # Explicit separator project:path
     if ":" in source:
         project, path = source.split(":", 1)
         parts = project.rsplit("/", 1)
         if len(parts) == 2:
-            return {"owner": parts[0], "repo": parts[1], "path": path}
+            return {"owner": parts[0], "repo": parts[1], "path": path, "wiki": False}
         # Safe fallback if there is no slash in the project name
-        return {"owner": project, "repo": None, "path": path}
+        return {"owner": project, "repo": None, "path": path, "wiki": False}
 
     # Otherwise, return full path as owner and let connector resolve repo/path dynamically
-    return {"owner": source, "repo": None, "path": None}
+    return {"owner": source, "repo": None, "path": None, "wiki": False}
