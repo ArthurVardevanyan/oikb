@@ -318,6 +318,8 @@ async def _run_entry_locked(entry: dict, dry_run: bool = False) -> dict | None:
                 "modified": result.modified,
                 "deleted": result.deleted,
                 "unmodified": result.unmodified,
+                "warnings": result.warnings or [],
+                "errors": result.errors or [],
                 "summary": result.summary(),
             }
 
@@ -334,6 +336,7 @@ async def _run_entry_locked(entry: dict, dry_run: bool = False) -> dict | None:
             "files_modified": result.modified,
             "files_deleted": result.deleted,
             "unmodified": result.unmodified,
+            "warnings": result.warnings or [],
             "errors": result.errors or [],
         }
 
@@ -351,12 +354,13 @@ async def _run_entry_locked(entry: dict, dry_run: bool = False) -> dict | None:
                 _history.log,
                 source=source,
                 kb_id=kb_id,
-                status="success",
+                status=status,
                 started_at=started_at,
                 files_added=result.added,
                 files_modified=result.modified,
                 files_deleted=result.deleted,
                 unmodified=result.unmodified,
+                error="\n".join(result.errors or []) or None,
             )
 
         log.info(
@@ -372,6 +376,7 @@ async def _run_entry_locked(entry: dict, dry_run: bool = False) -> dict | None:
             "files_added": result.added,
             "files_modified": result.modified,
             "files_deleted": result.deleted,
+            "warnings": result.warnings or [],
             "errors": result.errors or [],
         })
 

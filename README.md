@@ -1,6 +1,6 @@
 # 📚 oikb
 
-Keep your [Open WebUI](https://github.com/open-webui/open-webui) Knowledge Bases in sync. Point it at a local directory, a GitHub repo, a Confluence space, an S3 bucket, or any of 45 supported sources. Only new and modified files are uploaded via incremental SHA-256 diffing.
+Keep your [Open WebUI](https://github.com/open-webui/open-webui) Knowledge Bases in sync. Point it at a local directory, a GitHub repo, a Confluence space, an S3 bucket, Zotero, or any of 46 supported sources. Only new and modified files are uploaded via incremental SHA-256 diffing.
 
 > [!IMPORTANT]
 > Requires **Open WebUI 0.9.6+**
@@ -136,7 +136,7 @@ services:
       start_period: 15s
 ```
 
-## 45 Connectors
+## 46 Connectors
 
 | Category | Sources |
 |---|---|
@@ -149,6 +149,7 @@ services:
 | **Forums** | XenForo |
 | **Sales & CRM** | Salesforce, HubSpot |
 | **Web** | Website / Sitemap crawler |
+| **Research** | Zotero |
 
 ```bash
 oikb sync github:owner/repo --kb-id your-kb-id
@@ -156,9 +157,33 @@ oikb sync confluence:ENG --kb-id your-kb-id
 oikb sync s3://bucket/prefix --kb-id your-kb-id
 oikb sync nextcloud:/Documents --kb-id your-kb-id
 oikb sync servicenow:incident --kb-id your-kb-id
+oikb sync "zotero:Research%%Machine Learning" --kb-id your-kb-id
 ```
 
-Some connectors need an optional extra: `pip install oikb[gdrive]`, `pip install oikb[s3]`, or `pip install oikb[all]` for everything.
+Some connectors need an optional extra: `pip install oikb[gdrive]`, `pip install oikb[s3]`, `pip install oikb[zotero]`, or `pip install oikb[all]` for everything.
+
+### Zotero
+
+```bash
+export ZOTERO_LIBRARY_ID=123456
+export ZOTERO_API_KEY=...
+
+oikb sync "zotero:" --kb-id your-kb-id                 # all top-level collections plus _unfiled
+oikb sync "zotero:Research%%Machine Learning" --kb-id your-kb-id
+```
+
+Options:
+
+| Variable | Description |
+|---|---|
+| `ZOTERO_LIBRARY_TYPE` | `user` (default) or `group` |
+| `ZOTERO_INCLUDE_NOTES` | Append child notes when set to `1`, `true`, `yes`, or `on` |
+| `ZOTERO_INCLUDE_ANNOTATIONS` | Append PDF annotation text/comments |
+| `ZOTERO_CHECKSUM` | `version` (default) or `content` |
+| `ZOTERO_EXCLUDE` | Comma-separated collection paths to skip |
+| `ZOTERO_UNFILED_DIR` | Directory for root library items, default `_unfiled` |
+| `ZOTERO_WEBDAV_URL` | WebDAV Zotero storage base; fetches `<attachment-key>.zip` on Zotero file 404 |
+| `ZOTERO_WEBDAV_USER` / `ZOTERO_WEBDAV_PASSWORD` | WebDAV credentials |
 
 ## Filters
 

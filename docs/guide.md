@@ -342,9 +342,38 @@ sources:
     interval: 1h
 ```
 
+### Zotero
+
+Sync PDF attachment text from Zotero collections into KB directories. A bare
+`zotero:` syncs all top-level collections and root library items into
+`_unfiled`; use `%%` for nested collections.
+
+```bash
+pip install oikb[zotero]
+
+export ZOTERO_LIBRARY_ID=123456
+export ZOTERO_API_KEY=...
+
+oikb sync "zotero:" --kb-id your-kb-id
+oikb sync "zotero:Research%%Machine Learning" --kb-id your-kb-id
+```
+
+Optional settings:
+
+| Variable | Description |
+|---|---|
+| `ZOTERO_LIBRARY_TYPE` | `user` (default) or `group` |
+| `ZOTERO_INCLUDE_NOTES` | Append child notes when true |
+| `ZOTERO_INCLUDE_ANNOTATIONS` | Append PDF annotation text/comments when true |
+| `ZOTERO_CHECKSUM` | `version` (default) or `content` |
+| `ZOTERO_EXCLUDE` | Comma-separated collection paths to skip |
+| `ZOTERO_UNFILED_DIR` | Directory for root library items, default `_unfiled` |
+| `ZOTERO_WEBDAV_URL` | WebDAV Zotero storage base; fetches `<attachment-key>.zip` on Zotero file 404 |
+| `ZOTERO_WEBDAV_USER` / `ZOTERO_WEBDAV_PASSWORD` | WebDAV credentials |
+
 ### All Connectors
 
-45 connectors available. See the full list:
+46 connectors available. See the full list:
 
 | Category | Sources |
 |---|---|
@@ -357,6 +386,7 @@ sources:
 | **Forums** | XenForo |
 | **Sales & CRM** | Salesforce, HubSpot |
 | **Web** | Website / Sitemap crawler |
+| **Research** | Zotero |
 
 ---
 

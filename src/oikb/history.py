@@ -142,7 +142,7 @@ class SyncHistory:
             sql += " AND kb_id = ?"
             params.append(kb_id)
         if errors_only:
-            sql += " AND status = 'error'"
+            sql += " AND status IN ('error', 'partial')"
 
         sql += " ORDER BY started_at DESC LIMIT ?"
         params.append(limit)

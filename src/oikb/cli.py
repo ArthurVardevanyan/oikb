@@ -461,6 +461,21 @@ def sync(
                     prefix = "Dry run" if dry_run else "Done"
                     click.echo(f"  {prefix}: {result.summary()}")
 
+                if result.warnings and not quiet:
+                    click.echo(
+                        click.style(f"\n{len(result.warnings)} warning(s):", fg="yellow"),
+                        err=True,
+                    )
+                    for warning in result.warnings:
+                        click.echo(f"  - {warning}", err=True)
+                if result.errors:
+                    click.echo(
+                        click.style(f"\n{len(result.errors)} error(s):", fg="red"),
+                        err=True,
+                    )
+                    for err in result.errors:
+                        click.echo(f"  - {err}", err=True)
+
                 if result.errors:
                     has_errors = True
 
@@ -512,10 +527,16 @@ def sync(
         prefix = "Dry run" if dry_run else "Sync complete"
         click.echo(f"{prefix}: {result.summary()}")
 
+    if result.warnings and not quiet:
+        click.echo(click.style(f"\n{len(result.warnings)} warning(s):", fg="yellow"), err=True)
+        for warning in result.warnings:
+            click.echo(f"  - {warning}", err=True)
     if result.errors:
         click.echo(click.style(f"\n{len(result.errors)} error(s):", fg="red"), err=True)
         for err in result.errors:
-            click.echo(f"  • {err}", err=True)
+            click.echo(f"  - {err}", err=True)
+
+    if result.errors:
         sys.exit(1)
 
 
