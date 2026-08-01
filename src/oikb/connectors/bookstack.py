@@ -1,4 +1,10 @@
-"""BookStack connector — sync pages from a BookStack instance.
+# ---
+# co_authored_by:
+#   - @hexsm
+#     pull_request: https://github.com/open-webui/oikb/pull/84
+# ---
+
+"""BookStack connector — sync pages, chapters, or books from a BookStack instance.
 
 Auth via BOOKSTACK_URL, BOOKSTACK_TOKEN_ID, BOOKSTACK_TOKEN_SECRET env vars.
 """
