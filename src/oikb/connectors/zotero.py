@@ -1,8 +1,14 @@
+# ---
+# co_authored_by:
+#   - @thiswillbeyourgithub
+#     pull_request: https://github.com/open-webui/oikb/pull/61
+# ---
+
 """Zotero connector - sync PDF attachment text from a Zotero library.
 
 Auth via ZOTERO_LIBRARY_ID, ZOTERO_API_KEY, and optional ZOTERO_LIBRARY_TYPE.
 Source syntax: zotero:<collection>%%<subcollection>. Use bare zotero: for all
-top-level collections.
+top-level collections and unfiled library items.
 """
 
 from __future__ import annotations
