@@ -90,6 +90,23 @@ class OikbClient:
         resp.raise_for_status()
         return resp.json()
 
+    def get_file_status(self, file_id: str) -> dict[str, Any]:
+        """GET /files/{id}/process/status — check background linking status."""
+        resp = self._http.get(f"/files/{file_id}/process/status")
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_file(self, file_id: str) -> dict[str, Any]:
+        """GET /files/{id} — get file details including any error message."""
+        resp = self._http.get(f"/files/{file_id}")
+        resp.raise_for_status()
+        return resp.json()
+
+    def delete_file(self, file_id: str) -> None:
+        """DELETE /files/{id} — delete a file, its embeddings, and storage blob."""
+        resp = self._http.delete(f"/files/{file_id}")
+        resp.raise_for_status()
+
     # ── Directory management ────────────────────────────────────
 
     def create_directory(

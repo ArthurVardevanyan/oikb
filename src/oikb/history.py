@@ -34,6 +34,21 @@ CREATE TABLE IF NOT EXISTS sync_log (
 CREATE INDEX IF NOT EXISTS idx_sync_log_kb_id  ON sync_log(kb_id);
 CREATE INDEX IF NOT EXISTS idx_sync_log_source ON sync_log(source);
 CREATE INDEX IF NOT EXISTS idx_sync_log_status ON sync_log(status);
+
+CREATE TABLE IF NOT EXISTS file_failures (
+    kb_id      TEXT NOT NULL,
+    path       TEXT NOT NULL,
+    filename   TEXT NOT NULL,
+    checksum   TEXT NOT NULL,
+    file_id    TEXT,
+    error      TEXT,
+    kind       TEXT NOT NULL,
+    attempts   INTEGER DEFAULT 1,
+    first_seen REAL NOT NULL,
+    last_seen  REAL NOT NULL,
+    PRIMARY KEY (kb_id, path, filename, checksum)
+);
+CREATE INDEX IF NOT EXISTS idx_file_failures_kind ON file_failures(kind);
 """
 
 
@@ -184,7 +199,7 @@ class SyncHistory:
                 self._pool.get_nowait()
             except queue.Empty:
                 break
-                
+
         # Close all tracked connections
         for conn in self._all_conns:
             try:
@@ -192,3 +207,52 @@ class SyncHistory:
             except Exception:
                 pass
         self._all_conns.clear()
+
+    def record_failure(self, kb_id: str, path: str, filename: str,
+                       checksum: str, file_id: str, error: str, kind: str) -> None:
+        """Record or update a file failure (upsert)."""
+        if not self._all_conns:
+            return
+        now = time.time()
+        with self._get_conn() as conn:
+            conn.execute(
+                """INSERT INTO file_failures
+                   (kb_id, path, filename, checksum, file_id, error, kind,
+                    attempts, first_seen, last_seen)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(kb_id, path, filename, checksum) DO UPDATE SET
+                       file_id = excluded.file_id,
+                       error = excluded.error,
+                       kind = excluded.kind,
+                       attempts = file_failures.attempts + 1,
+                       last_seen = excluded.last_seen
+                """,
+                (kb_id, path, filename, checksum, file_id, error, kind,
+                 now, now, now),
+            )
+            conn.commit()
+
+    def get_failures(self, kb_id: str) -> dict[tuple[str, str, str], dict[str, Any]]:
+        """Return failures for a KB, keyed by (path, filename, checksum)."""
+        if not self._all_conns:
+            return {}
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM file_failures WHERE kb_id = ?", (kb_id,),
+            ).fetchall()
+            return {
+                (row["path"], row["filename"], row["checksum"]): dict(row)
+                for row in rows
+            }
+
+    def clear_failure(self, kb_id: str, path: str, filename: str,
+                      checksum: str) -> None:
+        """Remove a failure record (used when linkage later succeeds)."""
+        if not self._all_conns:
+            return
+        with self._get_conn() as conn:
+            conn.execute(
+                "DELETE FROM file_failures WHERE kb_id = ? AND path = ? AND filename = ? AND checksum = ?",
+                (kb_id, path, filename, checksum),
+            )
+            conn.commit()

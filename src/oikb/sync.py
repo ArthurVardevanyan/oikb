@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fnmatch
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -22,6 +23,18 @@ from rich.progress import (
 
 from oikb.client import OikbClient
 from oikb.connectors import BaseConnector, ManifestEntry, SourceFileUnavailable
+from oikb.history import SyncHistory
+
+# ── Verification tuning ─────────────────────────────────────────────
+# Verify budget: max seconds to poll uploaded file statuses.
+# Set via env; default 90s keeps within the 120s httpx timeout.
+OIKB_VERIFY_BUDGET: float = float(os.environ.get("OIKB_VERIFY_BUDGET", "90"))
+OIKB_VERIFY_INTERVAL: float = float(os.environ.get("OIKB_VERIFY_INTERVAL", "2"))
+OIKB_MAX_TRANSIENT_ATTEMPTS: int = int(os.environ.get("OIKB_MAX_TRANSIENT_ATTEMPTS", "3"))
+OIKB_TRANSIENT_RETRY_AFTER: int = int(os.environ.get("OIKB_TRANSIENT_RETRY_AFTER", "86400"))
+
+# ── Duplicate-content detection ─────────────────────────────────────
+_DUPLICATE_PATTERNS = ("Duplicate content", "duplicate content")
 
 # Stderr console for progress output (keeps stdout clean for piping).
 _console = Console(stderr=True)
@@ -37,6 +50,7 @@ class SyncResult:
     unmodified: int = 0
     dirs_created: int = 0
     dirs_removed: int = 0
+    skipped: int = 0
     errors: list[str] | None = None
     warnings: list[str] | None = None
 
@@ -54,6 +68,8 @@ class SyncResult:
             parts.append(f"{self.deleted} deleted")
         if self.unmodified:
             parts.append(f"{self.unmodified} unchanged")
+        if self.skipped:
+            parts.append(f"{self.skipped} skipped")
         if self.dirs_created:
             parts.append(f"{self.dirs_created} dirs created")
         if self.dirs_removed:
@@ -131,6 +147,12 @@ def _fmt_size(n: int) -> str:
     return f"{n:.1f} TB"
 
 
+def _is_duplicate_error(error_msg: str) -> bool:
+    """Return True if the error is the duplicate-content guard."""
+    lower = error_msg.lower()
+    return any(p.lower() in lower for p in _DUPLICATE_PATTERNS)
+
+
 def run_sync(
     client: OikbClient,
     connector: BaseConnector,
@@ -151,6 +173,7 @@ def run_sync(
       4. Cleanup stale files (delete before upload)
       5. Create missing directories
       6. Upload added + modified files
+      7. Verify background linkage; reap failures
     """
     result = SyncResult()
     result.errors = []
@@ -326,128 +349,404 @@ def _run_sync_inner(
         *[(m, "modified") for m in modified],
     ]
 
-    if not files_to_upload:
-        return result
+    if files_to_upload:
+        # ── 6a. Skip cached permanent failures ───────────────────
+        history = SyncHistory()
+        try:
+            cache = history.get_failures(kb_id)
+        except Exception:
+            cache = {}
 
-    def _upload_one(
-        i: int, entry: dict, change_type: str, progress: Progress | None, task_id: Any,
-    ) -> tuple[str, str | None]:
-        """Upload a single file with retry."""
-        filename = entry["filename"]
-        path = entry.get("path", "")
-        display = f"{path}/{filename}" if path else filename
+        # (path, filename, checksum) -> cache entry
+        _cache_map: dict[tuple[str, str, str], dict[str, Any]] = cache
 
-        if verbose and not progress:
-            click.echo(f"  [{i}/{len(files_to_upload)}] {display}", err=True)
-
-        check_stop()
-        manifest_entry = manifest_by_key.get((path, filename))
-        if not manifest_entry:
-            return ("error", f"File not in manifest: {display}")
-
-        last_err: Exception | None = None
-        for attempt in range(3):
-            check_stop()
-            try:
-                content = connector.read_file(path, filename)
-                check_stop()
-                directory_id = directory_map.get(path) if path else None
-                client.upload_file(
-                    file_content=content,
-                    filename=filename,
-                    kb_id=kb_id,
-                    file_hash=manifest_entry.checksum,
-                    directory_id=directory_id,
-                )
-                if progress is not None:
-                    progress.update(task_id, advance=1, description=f"[cyan]{display}[/cyan]")
-                return (change_type, None)
-            except SourceFileUnavailable as e:
-                message = f"{display}: {e}"
-                if progress is not None:
-                    progress.update(task_id, advance=1, description=f"[yellow]⚠ {display}[/yellow]")
-                else:
-                    click.echo(click.style(f"  ⚠ {message}", fg="yellow"), err=True)
-                return ("warning", message)
-            except httpx.HTTPStatusError as e:
-                if e.response.status_code >= 500 and attempt < 2:
-                    time.sleep(2 ** attempt)
-                    check_stop()
-                    last_err = e
+        files_to_upload = [
+            (entry, ct)
+            for entry, ct in files_to_upload
+        ]
+        _filtered: list[tuple[dict, str]] = []
+        for entry, ct in files_to_upload:
+            path = entry.get("path", "")
+            filename = entry["filename"]
+            manifest_entry = manifest_by_key.get((path, filename))
+            checksum = manifest_entry.checksum if manifest_entry else ""
+            key = (path, filename, checksum)
+            cached = _cache_map.get(key)
+            if cached is None:
+                _filtered.append((entry, ct))
+                continue
+            kind = cached["kind"]
+            if kind == "permanent":
+                result.skipped += 1
+                if verbose:
+                    click.echo(
+                        f"  [dim]Skipped (permanent failure): {path}/{filename}[/dim]",
+                        err=True,
+                    )
+                continue
+            if kind == "transient" and cached["attempts"] >= OIKB_MAX_TRANSIENT_ATTEMPTS:
+                elapsed = time.time() - cached["last_seen"]
+                if elapsed < OIKB_TRANSIENT_RETRY_AFTER:
+                    result.skipped += 1
+                    if verbose:
+                        click.echo(
+                            f"  [dim]Skipped (transient, retrying tomorrow): {path}/{filename}[/dim]",
+                            err=True,
+                        )
                     continue
-                last_err = e
-                break
-            except SyncCancelled:
-                raise
-            except Exception as e:
-                last_err = e
-                break
+            _filtered.append((entry, ct))
 
-        if progress is not None:
-            progress.update(task_id, advance=1, description=f"[red]✗ {display}[/red]")
-        else:
-            click.echo(click.style(f"  ✗ {display}: {last_err}", fg="red"), err=True)
-        return ("error", f"{display}: {last_err}")
+        files_to_upload = _filtered
 
-    def _tally(outcome: tuple[str, str | None]) -> None:
-        """Update result counters from an upload outcome."""
-        kind, message = outcome
-        if kind == "added":
-            result.added += 1
-        elif kind == "modified":
-            result.modified += 1
-        elif kind == "warning" and message is not None:
-            result.warnings.append(message)
-        elif message is not None:
-            result.errors.append(message)
+        if files_to_upload:
+            # ── 6b. Upload phase ───────────────────────────────────
+            # Track (file_id, path, filename, checksum, change_type)
+            _upload_tracker: list[tuple[str, str, str, str, str]] = []
+
+            def _upload_one(
+                i: int, entry: dict, change_type: str, progress: Progress | None, task_id: Any,
+            ) -> tuple[str, str, str, str, str | None]:
+                """Upload a single file with retry.
+
+                Returns (change_type, path, filename, checksum, file_id_or_error).
+                file_id is the id from the upload response, or None on failure.
+                """
+                filename = entry["filename"]
+                path = entry.get("path", "")
+                display = f"{path}/{filename}" if path else filename
+
+                if verbose and not progress:
+                    click.echo(f"  [{i}/{len(files_to_upload)}] {display}", err=True)
+
+                check_stop()
+                manifest_entry = manifest_by_key.get((path, filename))
+                if not manifest_entry:
+                    return ("error", path, filename, "", f"File not in manifest: {display}")
+
+                file_id: str | None = None
+                last_err: Exception | None = None
+                for attempt in range(3):
+                    check_stop()
+                    try:
+                        content = connector.read_file(path, filename)
+                        check_stop()
+                        directory_id = directory_map.get(path) if path else None
+                        resp = client.upload_file(
+                            file_content=content,
+                            filename=filename,
+                            kb_id=kb_id,
+                            file_hash=manifest_entry.checksum,
+                            directory_id=directory_id,
+                        )
+                        file_id = resp.get("id", "")
+                        if progress is not None:
+                            progress.update(task_id, advance=1, description=f"[cyan]{display}[/cyan]")
+                        return (change_type, path, filename, manifest_entry.checksum, file_id)
+                    except SourceFileUnavailable as e:
+                        message = f"{display}: {e}"
+                        if progress is not None:
+                            progress.update(task_id, advance=1, description=f"[yellow]⚠ {display}[/yellow]")
+                        else:
+                            click.echo(click.style(f"  ⚠ {message}", fg="yellow"), err=True)
+                        return ("warning", path, filename, "", message)
+                    except httpx.HTTPStatusError as e:
+                        if e.response.status_code >= 500 and attempt < 2:
+                            time.sleep(2 ** attempt)
+                            check_stop()
+                            last_err = e
+                            continue
+                        last_err = e
+                        break
+                    except SyncCancelled:
+                        raise
+                    except Exception as e:
+                        last_err = e
+                        break
+
+                if progress is not None:
+                    progress.update(task_id, advance=1, description=f"[red]✗ {display}[/red]")
+                else:
+                    click.echo(click.style(f"  ✗ {display}: {last_err}", fg="red"), err=True)
+                return ("error", path, filename, "", f"{display}: {last_err}")
+
+            def _tally_upload(outcome: tuple[str, str, str, str, str | None]) -> None:
+                """Update result counters from an upload outcome."""
+                kind, path, filename, checksum, file_id = outcome
+                if kind == "added":
+                    result.added += 1
+                elif kind == "modified":
+                    result.modified += 1
+                elif kind == "warning":
+                    result.warnings.append(f"{path}/{filename}: {file_id}")
+                else:
+                    result.errors.append(f"{path}/{filename}: {file_id}")
+                if file_id is not None:
+                    _upload_tracker.append((file_id, path, filename, checksum, kind))
+
+            if show_progress:
+                progress = Progress(
+                    SpinnerColumn(),
+                    TextColumn("[bold blue]Uploading"),
+                    BarColumn(bar_width=30),
+                    MofNCompleteColumn(),
+                    TextColumn("•"),
+                    TextColumn("{task.description}"),
+                    TextColumn("•"),
+                    TimeElapsedColumn(),
+                    console=_console,
+                    transient=True,
+                )
+                with progress:
+                    task_id = progress.add_task("", total=len(files_to_upload))
+
+                    if concurrency > 1 and len(files_to_upload) > 1:
+                        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+                            futures = {
+                                pool.submit(_upload_one, i, entry, ct, progress, task_id): (entry, ct)
+                                for i, (entry, ct) in enumerate(files_to_upload, 1)
+                            }
+                            for future in as_completed(futures):
+                                _tally_upload(future.result())
+                    else:
+                        for i, (entry, change_type) in enumerate(files_to_upload, 1):
+                            _tally_upload(_upload_one(i, entry, change_type, progress, task_id))
+            else:
+                # Quiet or daemon mode — no progress bar.
+                if concurrency > 1 and len(files_to_upload) > 1:
+                    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+                        futures = {
+                            pool.submit(_upload_one, i, entry, ct, None, None): (entry, ct)
+                            for i, (entry, ct) in enumerate(files_to_upload, 1)
+                        }
+                        for future in as_completed(futures):
+                            _tally_upload(future.result())
+                else:
+                    for i, (entry, change_type) in enumerate(files_to_upload, 1):
+                        _tally_upload(_upload_one(i, entry, change_type, None, None))
+
+            # ── 6c. Verification phase ─────────────────────────────
+            if _upload_tracker:
+                _verify_uploads(
+                    client, kb_id, _upload_tracker, result, verbose, quiet,
+                    show_progress, concurrency, _console, check_stop,
+                )
+    else:
+        if not quiet:
+            click.echo("[dim]Nothing to upload.[/dim]", err=True)
+
+    return result
+
+
+def _verify_uploads(
+    client: OikbClient,
+    kb_id: str,
+    uploads: list[tuple[str, str, str, str, str]],
+    result: SyncResult,
+    verbose: bool,
+    quiet: bool,
+    show_progress: bool,
+    concurrency: int,
+    console: Console,
+    check_stop: Callable[[], None],
+) -> None:
+    """Poll status for uploaded files and reap failures."""
+    history = SyncHistory()
+    try:
+        _failure_cache = history.get_failures(kb_id)
+    except Exception:
+        _failure_cache = {}
+
+    deadline = time.time() + OIKB_VERIFY_BUDGET
+    uploaded_ids = [(file_id, path, filename, checksum, ct)
+                    for file_id, path, filename, checksum, ct in uploads]
 
     if show_progress:
         progress = Progress(
             SpinnerColumn(),
-            TextColumn("[bold blue]Uploading"),
-            BarColumn(bar_width=30),
+            TextColumn("[bold blue]Verifying"),
+            BarColumn(bar_width=20),
             MofNCompleteColumn(),
             TextColumn("•"),
             TextColumn("{task.description}"),
             TextColumn("•"),
             TimeElapsedColumn(),
-            console=_console,
+            console=console,
             transient=True,
         )
         with progress:
-            task_id = progress.add_task("", total=len(files_to_upload))
-
-            if concurrency > 1 and len(files_to_upload) > 1:
-                with ThreadPoolExecutor(max_workers=concurrency) as pool:
-                    futures = {
-                        pool.submit(_upload_one, i, entry, ct, progress, task_id): (entry, ct)
-                        for i, (entry, ct) in enumerate(files_to_upload, 1)
-                    }
-                    for future in as_completed(futures):
-                        _tally(future.result())
-            else:
-                for i, (entry, change_type) in enumerate(files_to_upload, 1):
-                    _tally(_upload_one(i, entry, change_type, progress, task_id))
+            task_id = progress.add_task("", total=len(uploaded_ids))
+            _poll_loop(client, kb_id, uploaded_ids, progress, task_id,
+                       deadline, concurrency, check_stop, result, history,
+                       _failure_cache, verbose)
     else:
-        # Quiet or daemon mode — no progress bar.
-        if concurrency > 1 and len(files_to_upload) > 1:
+        _poll_loop(client, kb_id, uploaded_ids, None, None, deadline,
+                   concurrency, check_stop, result, history, _failure_cache, verbose)
+
+
+def _poll_loop(
+    client: OikbClient,
+    kb_id: str,
+    uploads: list[tuple[str, str, str, str, str]],
+    progress: Progress | None,
+    task_id: Any,
+    deadline: float,
+    concurrency: int,
+    check_stop: Callable[[], None],
+    result: SyncResult,
+    history: SyncHistory,
+    _failure_cache: dict[tuple[str, str, str], dict[str, Any]],
+    verbose: bool = False,
+) -> None:
+    """Concurrent polling loop for file linkage status."""
+    interval = OIKB_VERIFY_INTERVAL
+
+    while True:
+        check_stop()
+        remaining = [(fid, p, fn, cs, ct) for fid, p, fn, cs, ct in uploads
+                     if fid is not None]
+        if not remaining:
+            break
+        if time.time() >= deadline:
+            if verbose:
+                click.echo(
+                    f"  [dim]Verify budget exhausted ({OIKB_VERIFY_BUDGET}s); "
+                    f"{len(remaining)} files still processing[/dim]",
+                    err=True,
+                )
+            break
+
+        if concurrency > 1 and len(remaining) > 1:
             with ThreadPoolExecutor(max_workers=concurrency) as pool:
-                futures = {
-                    pool.submit(_upload_one, i, entry, ct, None, None): (entry, ct)
-                    for i, (entry, ct) in enumerate(files_to_upload, 1)
-                }
+                futures: dict[Any, tuple[str, str, str, str, str]] = {}
+                for file_id, path, filename, checksum, ct in remaining:
+                    futures[pool.submit(client.get_file_status, file_id)] = \
+                        (file_id, path, filename, checksum, ct)
                 for future in as_completed(futures):
-                    _tally(future.result())
+                    file_id, path, filename, checksum, ct = futures[future]
+                    try:
+                        status_resp = future.result()
+                    except Exception as exc:
+                        status_resp = {"status": "failed", "error": str(exc)}
+                    _handle_status(
+                        client, status_resp, file_id, path, filename,
+                        checksum, ct, result, history, kb_id,
+                        _failure_cache, verbose,
+                    )
+                    if progress is not None:
+                        progress.update(task_id, advance=1)
         else:
-            for i, (entry, change_type) in enumerate(files_to_upload, 1):
-                _tally(_upload_one(i, entry, change_type, None, None))
+            for file_id, path, filename, checksum, ct in remaining:
+                try:
+                    status_resp = client.get_file_status(file_id)
+                except Exception as exc:
+                    status_resp = {"status": "failed", "error": str(exc)}
+                _handle_status(
+                    client, status_resp, file_id, path, filename,
+                    checksum, ct, result, history, kb_id,
+                    _failure_cache, verbose,
+                )
+                if progress is not None:
+                    progress.update(task_id, advance=1)
 
-    return result
+        # Sleep until next poll or deadline.
+        remaining_time = deadline - time.time()
+        if remaining_time > 0:
+            time.sleep(min(interval, remaining_time))
 
 
-def _echo_file_entry(entry: dict, prefix: str, color: str) -> None:
-    """Print a file entry with color."""
-    path = entry.get("path", "")
-    filename = entry["filename"]
-    display = f"{path}/{filename}" if path else filename
-    click.echo(click.style(f"  {prefix} {display}", fg=color))
+def _handle_status(
+    client: OikbClient,
+    status_resp: dict[str, Any],
+    file_id: str,
+    path: str,
+    filename: str,
+    checksum: str,
+    change_type: str,
+    result: SyncResult,
+    history: SyncHistory,
+    kb_id: str,
+    _failure_cache: dict[tuple[str, str, str], dict[str, Any]],
+    verbose: bool = False,
+) -> None:
+    """Process a single file status response."""
+    key = (path, filename, checksum)
+    status = status_resp.get("status", "")
+
+    if status == "completed":
+        # Linkage succeeded. Clear any transient failure record.
+        try:
+            history.clear_failure(kb_id, path, filename, checksum)
+        except Exception:
+            pass
+        _failure_cache.pop(key, None)
+        return
+
+    if status == "failed":
+        # Fetch the actual error message.
+        error_msg = status_resp.get("error", "")
+        try:
+            file_info = client.get_file(file_id)
+            error_msg = file_info.get("data", {}).get("error", error_msg)
+        except Exception:
+            pass
+
+        if not error_msg:
+            error_msg = f"Linkage failed (status={status})"
+
+        # Classify and record.
+        if _is_duplicate_error(error_msg):
+            kind = "permanent"
+        else:
+            kind = "transient"
+
+        cached = _failure_cache.get(key, {})
+        attempts = cached.get("attempts", 0) + 1
+
+        # For permanent failures, delete the orphan immediately.
+        if kind == "permanent":
+            try:
+                client.delete_file(file_id)
+            except Exception:
+                pass
+            # Decrement the counter that was incremented by _tally_upload.
+            if change_type == "added":
+                result.added = max(0, result.added - 1)
+            elif change_type == "modified":
+                result.modified = max(0, result.modified - 1)
+            result.errors.append(f"{path}/{filename}: {error_msg}")
+            if verbose:
+                click.echo(
+                    f"  [red]✗ {path}/{filename}: {error_msg}[/red]", err=True,
+                )
+            history.record_failure(kb_id, path, filename, checksum,
+                                   file_id, error_msg, kind)
+            _failure_cache[key] = {
+                "kind": kind, "attempts": attempts, "last_seen": time.time(),
+            }
+
+        else:
+            # Transient: track attempts.
+            if attempts >= OIKB_MAX_TRANSIENT_ATTEMPTS:
+                try:
+                    client.delete_file(file_id)
+                except Exception:
+                    pass
+                if change_type == "added":
+                    result.added = max(0, result.added - 1)
+                elif change_type == "modified":
+                    result.modified = max(0, result.modified - 1)
+                result.errors.append(f"{path}/{filename}: {error_msg}")
+                if verbose:
+                    click.echo(
+                        f"  [red]✗ {path}/{filename}: {error_msg}[/red]", err=True,
+                    )
+                history.record_failure(kb_id, path, filename, checksum,
+                                       file_id, error_msg, kind)
+                _failure_cache[key] = {
+                    "kind": kind, "attempts": attempts, "last_seen": time.time(),
+                }
+            else:
+                _failure_cache[key] = {
+                    "kind": kind, "attempts": attempts, "last_seen": time.time(),
+                }
+        return

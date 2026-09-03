@@ -49,6 +49,10 @@ def configure_logging(log_format: str = "text", log_level: str = "INFO") -> None
     root = logging.getLogger()
     root.setLevel(getattr(logging, log_level.upper(), logging.INFO))
 
+    # Suppress noisy INFO-level httpx request logs (404s, etc.).
+    # Actual errors (WARNING+) still surface.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+
     # Remove any existing handlers (uvicorn may add its own).
     root.handlers.clear()
 

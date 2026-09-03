@@ -1,0 +1,5 @@
+FROM ghcr.io/open-webui/oikb:0.4.0@sha256:e61c1beef9fe91d2f00ca8612e847eacc7d579e2e8e258f40fb1ef3e2891e8d4
+# Renovate: datasource=github-releases dep=open-webui/oikb
+COPY src/oikb/client.py  /app/src/oikb/client.py
+COPY src/oikb/history.py /app/src/oikb/history.py
+COPY src/oikb/sync.py    /app/src/oikb/sync.py
